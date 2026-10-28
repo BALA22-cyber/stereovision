@@ -1,0 +1,19 @@
+# Captured data and generated calibration/reconstruction products
+/data/
+/output/
+/test/
+/archives/
+/calibration/
+/results/
+/debug_previews/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local system files
+.DS_Store
