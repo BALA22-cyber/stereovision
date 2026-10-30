@@ -42,7 +42,7 @@ def detect_board(frame, pattern):
     return cv2.findChessboardCornersSB(gray, pattern)
 
 
-def display_frame(frame, pattern, found, corners, label):
+def display_frame(frame, pattern, found, corners, label, board_type="checkerboard"):
     if frame.ndim == 2:
         view = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     elif frame.shape[2] == 1:
@@ -50,7 +50,10 @@ def display_frame(frame, pattern, found, corners, label):
     else:
         view = frame.copy()
     if found:
-        cv2.drawChessboardCorners(view, pattern, corners, found)
+        if board_type == "charuco":
+            cv2.aruco.drawDetectedCornersCharuco(view, corners[0], corners[1].reshape(-1, 1))
+        else:
+            cv2.drawChessboardCorners(view, pattern, corners, found)
     status = "BOARD FOUND" if found else "BOARD NOT FOUND"
     color = (0, 220, 0) if found else (0, 0, 255)
     cv2.putText(view, f"{label}: {status}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
@@ -59,7 +62,7 @@ def display_frame(frame, pattern, found, corners, label):
     return cv2.resize(view, (int(width * scale), int(height * scale)))
 
 
-def review_calibration(images, cols, rows, square_mm):
+def review_calibration(images, cols, rows, square_mm, board_type="checkerboard", marker_mm=None, dictionary=None, charuco_legacy=False, min_charuco_corners=6):
     """Run the existing pipeline after capture, in a worker thread."""
     started = time.monotonic()
     out = images / "calibration_review"
@@ -75,7 +78,10 @@ def review_calibration(images, cols, rows, square_mm):
         pipeline = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(pipeline)
         dbg = pipeline.Debugger(False, out / "debug")
-        base = dict(images=images, cols=cols, rows=rows, square_size=square_mm / 1000.0)
+        base = dict(images=images, cols=cols, rows=rows, square_size=square_mm / 1000.0,
+                    board_type=board_type, marker_size=marker_mm / 1000.0 if marker_mm else None,
+                    dictionary=dictionary, charuco_legacy=charuco_legacy, min_charuco_corners=min_charuco_corners)
+        target = pipeline.make_charuco_target(argparse.Namespace(**base)) if board_type == "charuco" else None
         intrinsics_path = out / "intrinsics.npz"
         try:
             pipeline.calibrate_intrinsics(argparse.Namespace(**base, out=intrinsics_path), dbg)
@@ -85,8 +91,13 @@ def review_calibration(images, cols, rows, square_mm):
             pair_metrics = []
             for name, left_path, right_path in pipeline.camera_pairs(images):
                 left, right = pipeline.read_pair(left_path, right_path, rig["size"])
-                cl = pipeline.detect_checkerboard(left, cols, rows)
-                cr = pipeline.detect_checkerboard(right, cols, rows)
+                if target:
+                    dl, dr = target.detect(left), target.detect(right)
+                    shared = target.shared(dl, dr)
+                    cl, cr = (shared[1], shared[2]) if shared is not None else (None, None)
+                else:
+                    cl = pipeline.detect_checkerboard(left, cols, rows)
+                    cr = pipeline.detect_checkerboard(right, cols, rows)
                 row = {"pair": name, "left_detected": cl is not None, "right_detected": cr is not None}
                 if cl is not None and cr is not None:
                     row.update(pipeline.epi_metrics([cl], [cr], rig))
@@ -120,6 +131,11 @@ def main():
                         help="automatically save valid pairs at the configured interval")
     parser.add_argument("--interval-sec", type=float, default=2.0,
                         help="seconds between automatic pair captures (default: 2)")
+    parser.add_argument("--board-type", choices=["checkerboard", "charuco"], default="checkerboard")
+    parser.add_argument("--marker-mm", type=float, help="ChArUco marker edge length in mm")
+    parser.add_argument("--dictionary", help="OpenCV ArUco dictionary matching the printed board")
+    parser.add_argument("--charuco-legacy", action="store_true", help="use the legacy OpenCV ChArUco layout")
+    parser.add_argument("--min-charuco-corners", type=int, default=6, help="minimum non-collinear shared corners")
     parser.add_argument("--review-calibration", action="store_true",
                         help="after capture, run pipeline calibration and per-pair review in a worker thread")
     args = parser.parse_args()
@@ -127,6 +143,19 @@ def main():
     if (args.cols < 2 or args.rows < 2 or args.square_mm <= 0 or args.count < 1
             or args.interval_sec <= 0):
         parser.error("cols/rows must be >= 2; square-mm, count, and interval-sec must be positive")
+
+    target = None
+    if args.board_type == "charuco":
+        if args.marker_mm is None or not args.dictionary:
+            parser.error("ChArUco requires --marker-mm and --dictionary matching the printed board")
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "stereo_calibration_workflow"))
+        from charuco_support import CharucoTarget
+        try:
+            target = CharucoTarget(args.cols, args.rows, args.square_mm, args.marker_mm,
+                                   args.dictionary, args.charuco_legacy, args.min_charuco_corners)
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
 
     if args.output.exists():
         if not args.output.is_dir():
@@ -209,10 +238,17 @@ def main():
                         continue
                     right_frame = converter.Convert(rres).Array.copy()
 
-                left_found, left_corners = detect_board(left_frame, pattern)
-                right_found, right_corners = detect_board(right_frame, pattern)
-                left_view = display_frame(left_frame, pattern, left_found, left_corners, "LEFT")
-                right_view = display_frame(right_frame, pattern, right_found, right_corners, "RIGHT")
+                if target:
+                    left_corners, right_corners = target.detect(left_frame), target.detect(right_frame)
+                    left_found, right_found = left_corners is not None, right_corners is not None
+                    shared = target.shared(left_corners, right_corners)
+                    usable = shared is not None
+                else:
+                    left_found, left_corners = detect_board(left_frame, pattern)
+                    right_found, right_corners = detect_board(right_frame, pattern)
+                    usable = left_found and right_found
+                left_view = display_frame(left_frame, pattern, left_found, left_corners, "LEFT", args.board_type)
+                right_view = display_frame(right_frame, pattern, right_found, right_corners, "RIGHT", args.board_type)
                 if left_view.shape[0] != right_view.shape[0]:
                     target_height = min(left_view.shape[0], right_view.shape[0])
                     left_view = cv2.resize(left_view, (int(left_view.shape[1] * target_height / left_view.shape[0]), target_height))
@@ -235,8 +271,8 @@ def main():
                         continue
                 elif key != ord(" "):
                     continue
-                if not (left_found and right_found):
-                    print("Pair skipped: checkerboard must be detected in both cameras.")
+                if not usable:
+                    print("Pair skipped: target must have enough corresponding corners in both views.")
                     if args.auto:
                         next_auto_capture = time.monotonic() + args.interval_sec
                     continue
@@ -260,6 +296,11 @@ def main():
                     "camera_settings": camera_settings,
                     "stored_pixel_format": "BGR8 PNG (demosaiced by pylon)",
                     "hardware_synchronized": False,
+                    "board_type": args.board_type,
+                    "charuco_dictionary": args.dictionary if target else None,
+                    "charuco_marker_size_mm": args.marker_mm if target else None,
+                    "charuco_legacy_pattern": args.charuco_legacy if target else None,
+                    "min_charuco_corners": args.min_charuco_corners if target else None,
                     "board_inner_corners_cols_rows": [args.cols, args.rows],
                     "square_size_mm": args.square_mm,
                     "pairs": captures,
@@ -278,7 +319,9 @@ def main():
     if args.review_calibration:
         print("[review] Running detection and calibration on a background worker; waiting for results.")
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="calibration-review") as executor:
-            executor.submit(review_calibration, args.output, args.cols, args.rows, args.square_mm).result()
+            executor.submit(review_calibration, args.output, args.cols, args.rows, args.square_mm,
+                            args.board_type, args.marker_mm, args.dictionary, args.charuco_legacy,
+                            args.min_charuco_corners).result()
 
 
 if __name__ == "__main__":

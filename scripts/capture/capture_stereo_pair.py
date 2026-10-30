@@ -41,10 +41,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--continuous", action="store_true",
                         help="keep running: each Space saves another pair; Q quits")
+    parser.add_argument("--count", type=int, help="stop after this many saved pairs (requires --continuous for more than one)")
     parser.add_argument("--output", type=Path, default=Path("data/captures/stereo_capture_pair"))
     parser.add_argument("--left-serial", default="41958448")
     parser.add_argument("--right-serial", default="41958460")
     args = parser.parse_args()
+    if args.count is not None and (args.count < 1 or (args.count > 1 and not args.continuous)):
+        parser.error("--count must be positive; counts above 1 require --continuous")
     if args.left_serial == args.right_serial:
         parser.error("left and right serials must differ")
 
@@ -124,7 +127,7 @@ def main():
                 raise
             count += 1
             print(f"Saved pair {count}: {left_name} + {right_name}")
-            if not args.continuous:
+            if not args.continuous or (args.count is not None and count >= args.count):
                 break
     print(f"Finished: {count} pairs saved to {args.output.resolve()}")
 

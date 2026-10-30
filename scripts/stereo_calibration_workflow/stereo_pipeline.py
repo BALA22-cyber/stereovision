@@ -151,6 +151,48 @@ def detect_checkerboard_dataset(folder, cols, rows, square_size, dbg):
     return by_side, (stereo_obj, stereo_l, stereo_r), size
 
 
+
+def make_charuco_target(args):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('charuco_support', Path(__file__).with_name('charuco_support.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    CharucoTarget = module.CharucoTarget
+    marker = getattr(args, 'marker_size', None)
+    dictionary = getattr(args, 'dictionary', None)
+    if marker is None or dictionary is None:
+        raise ValueError('ChArUco requires --marker-size and --dictionary matching the physical board.')
+    return CharucoTarget(args.cols, args.rows, args.square_size, marker, dictionary,
+                         getattr(args, 'charuco_legacy', False), getattr(args, 'min_charuco_corners', 6))
+
+
+def detect_board_dataset(args, dbg):
+    if getattr(args, 'board_type', 'checkerboard') == 'checkerboard':
+        return detect_checkerboard_dataset(args.images, args.cols, args.rows, args.square_size, dbg)
+    target = make_charuco_target(args)
+    sides = {'left': ([], []), 'right': ([], [])}
+    stereo_obj, stereo_l, stereo_r = [], [], []
+    size = None
+    for i, (name, lp, rp) in enumerate(camera_pairs(args.images), 1):
+        left, right = read_pair(lp, rp, size)
+        size = (left.shape[1], left.shape[0])
+        dl, dr = target.detect(left), target.detect(right)
+        for side, detection in [('left', dl), ('right', dr)]:
+            if detection is not None:
+                sides[side][0].append(target.objects(detection))
+                sides[side][1].append(detection[0])
+        shared = target.shared(dl, dr)
+        if shared is not None:
+            obj, l, r = shared
+            stereo_obj.append(obj); stereo_l.append(l); stereo_r.append(r)
+        print(f'  [{i:02d}] {name}: left={len(dl[1]) if dl else 0} right={len(dr[1]) if dr else 0} shared={len(shared[0]) if shared else 0}')
+        if dbg.enabled:
+            for image, detection in [(left, dl), (right, dr)]:
+                if detection is not None:
+                    cv2.aruco.drawDetectedCornersCharuco(image, detection[0], detection[1].reshape(-1, 1))
+            dbg.show('ChArUco detection', side_by_side(left, right), f'charuco/{name}.jpg' if i <= 8 else None)
+    return sides, (stereo_obj, stereo_l, stereo_r), size
+
 def output_npz(path: Path, **values):
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(str(path), **values)
@@ -169,7 +211,7 @@ def save_json(path: Path, data: dict):
 
 
 def calibrate_intrinsics(args, dbg):
-    sides, stereo, size = detect_checkerboard_dataset(args.images, args.cols, args.rows, args.square_size, dbg)
+    sides, stereo, size = detect_board_dataset(args, dbg)
     result = {}
     for label, suffix in [('left', '1'), ('right', '2')]:
         obj, pts = sides[label]
@@ -184,7 +226,9 @@ def calibrate_intrinsics(args, dbg):
     result['size'] = np.array(size)
     output_npz(args.out, **result)
     save_json(args.out.with_suffix('.json'),
-              {'image_size_px': size, 'checkerboard_inner_corners': [args.cols, args.rows],
+              {'image_size_px': size, 'board_type': getattr(args, 'board_type', 'checkerboard'),
+               'dictionary': getattr(args, 'dictionary', None), 'marker_size_m': getattr(args, 'marker_size', None),
+               'charuco_legacy': getattr(args, 'charuco_legacy', False), 'checkerboard_inner_corners': [args.cols, args.rows],
                'square_size_m': args.square_size,
                'left_detected': len(sides['left'][0]), 'right_detected': len(sides['right'][0]),
                'jointly_detected': len(stereo[0]),
@@ -280,8 +324,7 @@ def save_rig(out_dir: Path, intrinsics: dict, R, T, source, diagnostics, alpha):
 
 def calibrate_rig_board(args, dbg):
     intr = as_dict(args.intrinsics)
-    sides, (obj, left, right), size = detect_checkerboard_dataset(
-        args.images, args.cols, args.rows, args.square_size, dbg)
+    sides, (obj, left, right), size = detect_board_dataset(args, dbg)
     if tuple(intr['size']) != size:
         raise ValueError(f'Calibration image size {size} differs from saved intrinsics {intr["size"]}')
     if len(obj) < 6:
@@ -294,7 +337,7 @@ def calibrate_rig_board(args, dbg):
     rig = rectification_matrices(intr, R, T, args.alpha)
     metrics = epi_metrics(left, right, {**intr, **rig})
     metrics.update(stereo_rms_px=float(rms), jointly_detected_pairs=len(obj))
-    saved = save_rig(args.out, intr, R, T, 'checkerboard', metrics, args.alpha)
+    saved = save_rig(args.out, intr, R, T, getattr(args, 'board_type', 'checkerboard'), metrics, args.alpha)
     print('[rig-board] ' + json.dumps(metrics, indent=2))
     if dbg.enabled:
         _, lp, rp = camera_pairs(args.images)[0]
@@ -307,8 +350,8 @@ def calibrate_rig_board(args, dbg):
 def april_dictionary(family: str):
     if not hasattr(cv2, 'aruco'):
         raise RuntimeError('Missing cv2.aruco. Install opencv-contrib-python (avoid conflicting OpenCV pip wheels).')
-    fam = family.upper()
-    if not hasattr(cv2.aruco, fam):
+    fam = next((name for name in dir(cv2.aruco) if name.upper() == family.upper()), None)
+    if fam is None:
         raise ValueError(f'Unsupported --tag-family {family}. Example: DICT_APRILTAG_36h11')
     d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, fam))
     params = cv2.aruco.DetectorParameters()
@@ -740,6 +783,11 @@ def parse_args():
         subp.add_argument('--cols', type=int, required=True, help='checkerboard INNER corners across width')
         subp.add_argument('--rows', type=int, required=True, help='checkerboard INNER corners across height')
         subp.add_argument('--square-size', type=float, required=True, help='checkerboard square edge in METERS')
+        subp.add_argument('--board-type', choices=['checkerboard', 'charuco'], default='checkerboard')
+        subp.add_argument('--marker-size', type=float, help='ChArUco marker edge in meters')
+        subp.add_argument('--dictionary', help='OpenCV ArUco dictionary matching the physical ChArUco board')
+        subp.add_argument('--charuco-legacy', action='store_true', help='use the legacy OpenCV ChArUco layout')
+        subp.add_argument('--min-charuco-corners', type=int, default=6, help='minimum non-collinear detected/shared corners')
     def tags(subp):
         subp.add_argument('--images', type=Path, required=True)
         subp.add_argument('--tag-size', type=float, required=True, help='physical detected AprilTag edge length in METERS')
